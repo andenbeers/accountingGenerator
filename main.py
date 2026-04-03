@@ -1,0 +1,275 @@
+ #!/usr/bin/env python3
+
+import numbers
+
+import ollama
+import json
+import os
+from collections import defaultdict
+from paddleocr import PaddleOCR
+import pandas as pd
+import pdfplumber
+import ocrmypdf
+import openpyxl
+from openpyxl.utils import get_column_letter
+import math
+import numpy as np
+
+
+model = os.getenv("MODEL", "frob/nuextract-2.0:latest")
+
+def group_by_name(entries):
+    grouped = defaultdict(list)
+    for e in entries:
+        grouped[e['description']].append(e)
+    return grouped
+
+
+template = {
+  "dividends": [
+    {
+      "date": "string",
+      "description": "stock name",
+      "amount": "number $",
+      "action": "Reinvestment or Cash"
+    }
+  ],
+  "purchases": [
+    {
+      "date": "string",
+      "description": "stock name",
+      "quantity": "number",
+      "amount": "number $",
+    }
+  ],
+  "sales": [
+    {
+      "date": "string",
+      "description": "stock name",
+      "quantity": "number",
+      "amount": "number $",
+      "realized_gain_loss": "number",
+      "carry_value": "number",
+    }
+  ]
+}
+
+examples = [
+  {
+    "input": "Date, Category, Action, Symbol, Description, Quanity, Price/Rate, Charged Interest, Amount ($), Realized Gain (Loss)($)"
+    "9/6, Dividend, Cash Dividend, IBTF, ISHARES IBONDS TERM, , , , 17.33,",
+    "output": """{
+      "dividends": [
+        {
+          "date": "09/06",
+          "description": "ISHARES IBONDS TERM",
+          "amount": 17.33,
+          "action": "Cash Dividend"
+        }
+      ],
+      "purchases": [],
+      "sales": []
+    }"""
+  },
+  {
+    "input": "Date, Category, Action, Symbol, Description, Quanity, Price/Rate, Charged Interest, Amount ($), Realized Gain (Loss)($)"
+    "9/11, Purchase, Buy, VUG, VANGUARD GROWTH ETF, 6.000, 363.0799, , -2178.48,",
+    "output": """{
+      "dividends": [],
+      "purchases": [
+        {
+          "date": "09/11",
+          "description": "VANGUARD GROWTH ETF",
+          "quantity": 6.0,
+          "amount": -2178.48
+        }
+      ],
+      "sales": []
+    }"""
+  },
+  {
+    "input": "Date, Category, Action, Symbol, Description, Quanity, Price/Rate, Charged Interest, Amount ($), Realized Gain (Loss)($)"
+    "9/11, Sale, Sell, IBTE, ISHARES IBONDS TERM TREASURY ETF, 331.000, 23.9300, 0.27, 7920.56, 12.97",
+    "output": """{
+      "dividends": [],
+      "purchases": [],
+      "sales": [
+        {
+          "date": "09/11",
+          "description": "ISHARES IBONDS TERM TREASURY ETF",
+          "quantity": 331.0,
+          "amount": 7920.56,
+          "realized_gain_loss": 12.97
+        }
+      ]
+    }"""
+  }
+]
+  
+
+
+  
+from pdf2image import convert_from_path
+
+
+POPPLER_PATH = r"poppler\Library\bin"  
+
+def ocr_pdf_to_text(pdf_path):
+    # Convert PDF → images
+    images = convert_from_path(
+        pdf_path,
+        dpi=300,
+        poppler_path=POPPLER_PATH,
+        size=(1654, 2339)
+    )
+
+    # Initialize OCR (CPU only)
+    ocr = PaddleOCR(
+        use_angle_cls=True,
+        lang='en',
+        det_db_box_thresh=0.6,
+        det_db_unclip_ratio=2.0,
+        det_limit_side_len=2000,
+        ocr_version='PP-OCRv4',
+    )
+
+    document_lines = []
+
+    for i, img in enumerate(images):
+        print(f"Processing page {i+1}...")
+
+        # Save temp image (Paddle works better with file paths)
+        img_path = f"temp_page_{i}.png"
+        img.save(img_path)
+
+        result = ocr.ocr(img_path)
+
+        all_words = []
+
+    for page in result:
+        if 'rec_texts' in page and 'dt_polys' in page:
+            for text, poly in zip(page['rec_texts'], page['dt_polys']):
+                y_center = np.mean(poly[:, 1])
+                x_center = np.mean(poly[:, 0])
+                all_words.append((y_center, x_center, text))
+    
+    # Sort top-to-bottom
+    all_words.sort(key=lambda x: x[0])
+
+    lines = []
+    current_line = []
+    last_y = None
+
+    for y, x, text in all_words:
+        
+        y_thresh = 15  # Adjust as needed based on font size and spacing
+        if last_y is None or abs(y - last_y) <= y_thresh:
+            current_line.append((x, text))
+        else:
+            # Sort left-to-right within the line
+            current_line.sort(key=lambda w: w[0])
+            # Join with commas instead of spaces
+            lines.append(", ".join(w[1] for w in current_line))
+            current_line = [(x, text)]
+        last_y = y
+
+    if current_line:
+        current_line.sort(key=lambda w: w[0])
+        lines.append(", ".join(w[1] for w in current_line))
+
+    return "\n".join(lines)
+
+
+
+
+if __name__ == "__main__":
+   
+
+    document = ocr_pdf_to_text("input.pdf")
+    print(document)
+
+    messages = [
+      {"role": "template", "content": json.dumps(template)}
+    ]
+
+    for ex in examples:
+        messages.append({"role": "examples.input", "content": ex["input"]})
+        messages.append({"role": "examples.output", "content": ex["output"]})
+
+    messages.append({"role": "user", "content": document})
+
+    cases = []
+
+    response = ollama.chat(
+        model=model,
+        messages=messages
+    )
+      
+    data = {**json.loads(response.message.content)}
+
+    print(data)
+
+
+# Create a new workbook and select the active sheet
+
+
+wb = openpyxl.Workbook()
+ws = wb.active
+ws.title = "Transactions"
+
+row = 1
+
+def write_row(cells, amount_cols=None):
+    """Write a row to the sheet.
+    amount_cols: list of zero-based column indices to format as accounting
+    """
+    global row
+    if amount_cols is None:
+        amount_cols = []
+    for col, value in enumerate(cells, start=1):
+        cell = ws.cell(row=row, column=col, value=value)
+        if col-1 in amount_cols and isinstance(value, (int, float)):
+            cell.number_format = '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'  # <-- proper accounting format string
+    row += 1
+
+# Purchases
+write_row(['Purchases:'])
+purchases_grouped = group_by_name(data['purchases'])
+for name, items in purchases_grouped.items():
+    write_row([name])
+    write_row(['Date', 'Quantity', 'Amount'])
+    for item in items:
+        # Amount is column 2 (0-based index)
+        write_row([item['date'], f"{item['quantity']:.3f} shares", math.fabs(float(item['amount']))], amount_cols=[2])
+    row += 1
+
+# Sales
+write_row(['Sales:'])
+sales_grouped = group_by_name(data['sales'])
+for name, items in sales_grouped.items():
+    write_row([name])
+    write_row(['Date', 'Quantity', 'Carry Value', 'Sales Price', 'Gain', 'Loss'])
+    for item in items:
+        gain_loss = item.get('realized_gain_loss', 0)
+        carry_value = item.get('carry_value')
+        if carry_value is None and gain_loss is not None:
+            carry_value = item['amount'] - gain_loss
+        # Columns 2=Amount, 3=Carry_Value, 4=Gain, 5=Loss
+        write_row([
+            item['date'],
+            f"{item['quantity']:.3f} shares",
+            float(carry_value) if carry_value is not None else None,
+            float(item['amount']),
+            float(gain_loss) if gain_loss > 0 else None,
+            float(-gain_loss) if gain_loss < 0 else None
+        ], amount_cols=[2,3,4,5])
+    row += 1
+
+# Dividends
+write_row(['Dividends:'])
+write_row(['Date', 'Name', 'Amount'])
+for d in data['dividends']:
+    write_row([d['date'], d['description'], float(d['amount'])], amount_cols=[2])
+
+# Save workbook
+wb.save('transactions.xlsx')
