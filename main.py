@@ -8,12 +8,12 @@ import os
 from collections import defaultdict
 from paddleocr import PaddleOCR
 import pandas as pd
-import pdfplumber
-import ocrmypdf
+
 import openpyxl
 from openpyxl.utils import get_column_letter
 import math
 import numpy as np
+
 
 
 model = os.getenv("MODEL", "frob/nuextract-2.0:latest")
@@ -32,7 +32,8 @@ template = {
       "date": "string",
       "description": "stock name",
       "amount": "number $",
-      "action": "Reinvestment or Cash"
+      "action": "Reinvestment or Cash",
+      "cusip": "cusip or symbol"
     }
   ],
   "purchases": [
@@ -41,6 +42,7 @@ template = {
       "description": "stock name",
       "quantity": "number",
       "amount": "number $",
+      "cusip": "cusip or symbol"
     }
   ],
   "sales": [
@@ -51,12 +53,14 @@ template = {
       "amount": "number $",
       "realized_gain_loss": "number",
       "carry_value": "number",
+      "cusip": "cusip or symbol"
     }
   ],
   "interest": [
       {
         "date": "string",
-        "amount": "number $"
+        "amount": "number $",
+        "quanity": "number or null"
       }
   ]
 }
@@ -72,6 +76,7 @@ examples = [
           "description": "ISHARES IBONDS TERM",
           "amount": 17.33,
           "action": "Cash Dividend"
+          "cusip": "IBTF"
         }
       ],
       "purchases": [],
@@ -88,7 +93,8 @@ examples = [
           "date": "09/11",
           "description": "VANGUARD GROWTH ETF",
           "quantity": 6.0,
-          "amount": -2178.48
+          "amount": -2178.48,
+          cusip": "VUG"
         }
       ],
       "sales": []
@@ -106,74 +112,115 @@ examples = [
           "description": "ISHARES IBONDS TERM TREASURY ETF",
           "quantity": 331.0,
           "amount": 7920.56,
-          "realized_gain_loss": 12.97
+          "realized_gain_loss": 12.97,
+          cusip": "IBTE"
         }
       ]
     }"""
+  },
+  {
+  "input": "Date, Category, Action, Symbol, Description, Quanity, Price/Rate, Charged Interest, Amount ($), Realized Gain (Loss)($)"
+  "9/11, Interest, Bank Interest, , , , , 0.27, ,",
+  "output": """{
+  "dividends": [],
+  "purchases": [],
+  "sales": [],
+  "interest": [
+    {
+      "date": "09/11",
+      "amount": 0.27,
+      "quanity": null
+    
+    }
+    ]
+    }"""
   }
-]
+  ]
+  
+
+
   
 from pdf2image import convert_from_path
 
 POPPLER_PATH = r"poppler\Library\bin"  
 
 def ocr_pdf_to_pages(pdf_path):
-    images = convert_from_path(
-        pdf_path,
-        dpi=300,
-        poppler_path=POPPLER_PATH,
-    )
-
-    ocr = PaddleOCR(
-        use_angle_cls=True,
-        lang='en',
-        det_db_box_thresh=0.6,
-        det_db_unclip_ratio=2.0,
-        det_limit_side_len=2000,
-        ocr_version='PP-OCRv4',
-    )
-
+    images = convert_from_path(pdf_path, dpi=300, poppler_path=POPPLER_PATH)
+    ocr = PaddleOCR(use_angle_cls=False, lang='en', ocr_version='PP-OCRv4', show_log=False)
     pages_text = []
 
     for i, img in enumerate(images):
         print(f"Processing page {i+1}...")
-
         img_path = f"temp_page_{i}.png"
         img.save(img_path)
-
         result = ocr.ocr(img_path)
 
+        # Extract words with bounding boxes
         all_words = []
-
         for page in result:
-            if 'rec_texts' in page and 'dt_polys' in page:
-                for text, poly in zip(page['rec_texts'], page['dt_polys']):
-                    y_bottom = np.max(poly[:, 1])
-                    x_center = np.mean(poly[:, 0])
-                    all_words.append((y_bottom, x_center, text))
+            if not page:
+                continue
+            for line in page:
+                poly, (text, score) = line
+                poly = np.array(poly)
+                x_min = np.min(poly[:, 0])
+                x_max = np.max(poly[:, 0])
+                y_min = np.min(poly[:, 1])
+                y_max = np.max(poly[:, 1])
+                all_words.append({
+                    'text': text,
+                    'x_center': (x_min + x_max) / 2,
+                    'y_center': (y_min + y_max) / 2,
+                    'x_min': x_min,
+                })
 
-        all_words.sort(key=lambda x: x[0])
+        if not all_words:
+            pages_text.append("")
+            continue
 
-        lines = []
-        current_line = []
-        last_y = None
-
-        for y, x, text in all_words:
-            y_thresh = 10
-            if last_y is None or abs(y - last_y) <= y_thresh:
-                current_line.append((x, text))
+        # Cluster into rows by Y center
+        all_words.sort(key=lambda w: w['y_center'])
+        rows = []
+        current_row = [all_words[0]]
+        for w in all_words[1:]:
+            row_y = np.mean([x['y_center'] for x in current_row])
+            if abs(w['y_center'] - row_y) < 15:
+                current_row.append(w)
             else:
-                current_line.sort(key=lambda w: w[0])
-                lines.append(", ".join(w[1] for w in current_line))
-                current_line = [(x, text)]
-            last_y = y
+                rows.append(sorted(current_row, key=lambda x: x['x_min']))
+                current_row = [w]
+        rows.append(sorted(current_row, key=lambda x: x['x_min']))
 
-        if current_line:
-            current_line.sort(key=lambda w: w[0])
-            lines.append(", ".join(w[1] for w in current_line))
+        # Find header row (contains "Date")
+        header_row = next((r for r in rows if any('Date' in w['text'] for w in r)), rows[0])
 
-        page_text = "\n".join(lines)
-        pages_text.append(page_text)
+        # Define column boundaries from header
+        col_centers = [w['x_center'] for w in header_row]
+        col_names = [w['text'] for w in header_row]
+        boundaries = [0]
+        for j in range(len(col_centers) - 1):
+            boundaries.append((col_centers[j] + col_centers[j+1]) / 2)
+        boundaries.append(float('inf'))
+
+        def get_col(x):
+            for j in range(len(boundaries) - 1):
+                if boundaries[j] <= x < boundaries[j+1]:
+                    return j
+            return len(col_names) - 1
+
+        # Build output lines
+        lines = [", ".join(col_names)]
+        for row in rows:
+            if row is header_row:
+                continue
+            cols = [''] * len(col_names)
+            for w in row:
+                c = get_col(w['x_center'])
+                cols[c] = (cols[c] + ' ' + w['text']).strip()
+            if any(cols):
+                lines.append(", ".join(cols))
+
+        pages_text.append("\n".join(lines))
 
     return pages_text
 
@@ -209,11 +256,13 @@ if __name__ == "__main__":
         response = ollama.chat(
             model=model,
             messages=messages,
-            options={"temperature": 0.2}
+            options={"temperature": 0.2, "num_predict": 4096}
         )
+        print(response.message.content)
 
         try:
             page_data = json.loads(response.message.content)
+            
 
             
 
@@ -236,7 +285,7 @@ if __name__ == "__main__":
 
     # we need to sort the final data, each section of it by name of ['description'] and then by date, to make it easier to read in the excel file
     for section in ['dividends', 'purchases', 'sales', 'interest']:
-      data[section].sort(key=lambda x: (x.get('description',''), x.get('date','')))
+      data[section].sort(key=lambda x: (x.get('description') or '', x.get('date') or ''))
 
     print(data)
 
