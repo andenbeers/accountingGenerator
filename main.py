@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 
-import numbers
 import ollama
 import json
 import os
-from collections import defaultdict
+import base64
+import math
+from collections import defaultdict, Counter
+from datetime import date
 import openpyxl
 from openpyxl.utils import get_column_letter
-import math
-import csv
-import io
-from collections import Counter
 from openpyxl.styles import Font
 from pdf2image import convert_from_path
 
@@ -19,43 +17,12 @@ from pdf2image import convert_from_path
 # CONFIG
 # ─────────────────────────────────────────────
 
-model = os.getenv("MODEL", "frob/nuextract-2.0:latest")
-
+MODEL      = os.getenv("MODEL", "gemma3:27b")   # or gemma3:12b, qwen2.5vl:32b, etc.
 PDF_PATH   = "input4.pdf"
-PAGE_START = 4   # Fixed: was 5, page 4 has the first transactions
+PAGE_START = 4
 PAGE_END   = 6
 OUTPUT_XLS = "transactions.xlsx"
-
-
-# ─────────────────────────────────────────────
-# ASK USER FOR COLUMN ORDER
-# ─────────────────────────────────────────────
-
-print("\n=== Column Order Helper ===")
-print("Look at the Transaction Details table header in your PDF.")
-print("Enter the column names in order, separated by commas.")
-print("Example: Date, Category, Action, Symbol/CUSIP, Description, Quantity, Price/Rate per Share($), Charges/Interest($), Amount($), Realized Gain/Loss($)")
-print()
-
-raw_columns = input("Enter columns: ").strip()
-column_names = [c.strip() for c in raw_columns.split(",")]
-
-column_hint = (
-    "The transaction table columns are, in order: "
-    + ", ".join(f"{i+1}={name}" for i, name in enumerate(column_names))
-    + ". "
-    "Use the column named 'Amount($)' (or similar) for the dollar amount of each transaction, "
-    "NOT the 'Price/Rate per Share' column. "
-    "Use 'Realized Gain/Loss($)' (or similar) for realized_gain_loss. "
-    "Quantity should come from the 'Quantity' column and will be negative for sales. "
-    "IMPORTANT: some CSV cells contain multiple values separated by newline characters (\\n). "
-    "Each newline-separated value belongs to a DIFFERENT row in the table. "
-    "For example if the Amount($) cell reads '4.13\\n2.14\\n3.39\\n0.58', "
-    "those are four separate amounts — one per transaction row — not one value. "
-    "Match each value to its own row in order; do NOT copy the first value to every row."
-)
-
-print(f"\nColumn hint that will be sent to the model:\n  {column_hint}\n")
+DPI        = 300
 
 
 # ─────────────────────────────────────────────
@@ -63,137 +30,151 @@ print(f"\nColumn hint that will be sent to the model:\n  {column_hint}\n")
 # ─────────────────────────────────────────────
 
 template = {
-    "Statement Year": "string",
     "dividends": [
         {
-            "date": "string",
-            "cusip": "cusip or symbol",
-            "description": "stock name",
-            "amount": "number $",
-            "action": "Reinvestment or Cash",
+            "date": "string (MM/DD format)",
+            "cusip": "ticker symbol",
+            "description": "fund name",
+            "amount": "number",
+            "action": "Cash or Reinvestment"
         }
     ],
     "purchases": [
         {
-            "date": "string",
-            "cusip": "cusip or symbol",
-            "description": "stock name",
-            "quantity": "number",
-            "amount": "number $",
+            "date": "string (MM/DD format)",
+            "cusip": "ticker symbol",
+            "description": "fund name",
+            "quantity": "number (positive)",
+            "amount": "number (total dollar amount from Amount$ column, NOT price per share)"
         }
     ],
     "sales": [
         {
-            "date": "string",
-            "cusip": "cusip or symbol",
-            "description": "stock name",
-            "quantity": "number",
-            "amount": "number $",
-            "realized_gain_loss": "number",
-            "carry_value": "number or null",
+            "date": "string (MM/DD format)",
+            "cusip": "ticker symbol",
+            "description": "fund name",
+            "quantity": "number (positive)",
+            "amount": "number (total dollar amount from Amount$ column)",
+            "realized_gain_loss": "number (positive=gain, negative=loss)"
         }
     ],
     "interest": [
         {
-            "date": "string",
-            "amount": "number $",
-            "quantity": "number or null"
+            "date": "string (MM/DD format)",
+            "description": "description text",
+            "amount": "number"
         }
     ]
 }
 
+PROMPT = """You are extracting financial transactions from a brokerage statement image.
+
+ONLY extract rows from the "Transaction Details" table section.
+A valid transaction row has ALL of these: a Category (Dividend/Sale/Purchase/Interest), 
+a Symbol/CUSIP, a Description, and an Amount($).
+
+IGNORE everything that is NOT a transaction row:
+- Page headers, account name, statement period
+- Section titles like "Transaction Details", "Positions - Summary", etc.
+- Column headers (Date, Category, Action, Symbol, Description, Quantity, Price, Amount)
+- "Exchange Processing Fee $x.xx" lines
+- "Total Transactions" line
+- "Other Activity" lines
+- Any table that is NOT the Transaction Details table (Positions, Cost Basis, Bank Sweep Activity, etc.)
+- Footnotes, disclaimers, page numbers
+
+CRITICAL RULES:
+1. 'amount' must be the TOTAL dollar value from the Amount($) column — NOT Price/Rate per Share.
+2. If a row has no date printed, inherit the most recent date printed above it in the table.
+3. Each row is one transaction — do not merge rows.
+4. For sales, realized_gain_loss is positive for a gain, negative for a loss.
+5. Return ONLY valid JSON. No explanation, no markdown fences, no extra text.
+
+Return exactly this structure:
+""" + json.dumps(template, indent=2)
+
 
 # ─────────────────────────────────────────────
-# PDF → TEXT HELPERS
+# PDF → IMAGE HELPERS
 # ─────────────────────────────────────────────
 
-def img_to_rows(img_path, row_tolerance=8):
-    """
-    Run PaddleOCR on an image and reconstruct clean rows using bounding-box
-    Y-coordinates instead of img2table's borderless table detector.
-
-    img2table was merging adjacent rows into single cells because it tried to
-    infer table structure from visual whitespace — and borderless financial
-    statement tables fool it badly.
-
-    This approach is simpler and far more reliable:
-      1. Ask PaddleOCR for every text fragment + its bounding box.
-      2. Group fragments whose vertical centres are within `row_tolerance`
-         pixels of each other → these are on the same printed line.
-      3. Within each group, sort by X so columns come out left-to-right.
-      4. Join each row with a tab character and return one string per page.
-
-    The result is plain, one-printed-line-per-text-line output with no merged
-    cells, which the LLM can parse far more accurately.
-    """
-    from paddleocr import PaddleOCR as _PaddleOCR
-    ocr = _PaddleOCR(lang="en")
-    result = ocr.ocr(img_path, cls=True)
-
-    if not result or not result[0]:
-        return ""
-
-    # Each entry: (bbox, (text, confidence))
-    # bbox = [[x0,y0],[x1,y0],[x1,y1],[x0,y1]]
-    fragments = []
-    for line in result[0]:
-        bbox, (text, conf) = line
-        if conf < 0.5:
-            continue
-        y_center = (bbox[0][1] + bbox[2][1]) / 2
-        x_left   = bbox[0][0]
-        fragments.append((y_center, x_left, text))
-
-    if not fragments:
-        return ""
-
-    # Sort top-to-bottom, then left-to-right within each row
-    fragments.sort(key=lambda f: (f[0], f[1]))
-
-    # Group into rows: a new row starts when y_center jumps by > row_tolerance
-    rows = []
-    current_row = [fragments[0]]
-    for frag in fragments[1:]:
-        if frag[0] - current_row[-1][0] > row_tolerance:
-            rows.append(current_row)
-            current_row = [frag]
-        else:
-            current_row.append(frag)
-    rows.append(current_row)
-
-    # Render each row as a tab-separated line
-    lines = []
-    for row in rows:
-        row.sort(key=lambda f: f[1])           # left-to-right by x
-        lines.append("\t".join(f[2] for f in row))
-
-    return "\n".join(lines)
-
-
-def pdf_page_to_text(pdf_path, page_number_start, page_number_end):
+def pdf_to_images(pdf_path, page_start, page_end, dpi=DPI):
+    """Convert PDF pages to PNG images, return list of (page_num, file_path)."""
     images = convert_from_path(
         pdf_path,
-        dpi=300,
-        first_page=page_number_start,
-        last_page=page_number_end,
+        dpi=dpi,
+        first_page=page_start,
+        last_page=page_end,
         poppler_path="poppler/library/bin"
     )
-    pages = []
-    for i in range(page_number_end - page_number_start + 1):
-        page_number = page_number_start + i
-        temp_path = f"/tmp/page_{page_number}.png"
-        images[i].save(temp_path, "PNG")
-        pages.append(img_to_rows(temp_path))
-    return pages
+    result = []
+    for i, image in enumerate(images):
+        page_num  = page_start + i
+        temp_path = f"/tmp/page_{page_num}.png"
+        image.save(temp_path, "PNG")
+        result.append((page_num, temp_path))
+    return result
+
+
+def image_to_base64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+
+# ─────────────────────────────────────────────
+# MODEL CALL
+# ─────────────────────────────────────────────
+
+def call_vision_model(page_num, image_path):
+    """Send one page image to the vision model, return parsed dict or None."""
+    print(f"\nSending page {page_num} to {MODEL}...")
+
+    img_b64 = image_to_base64(image_path)
+
+    response = ollama.chat(
+        model=MODEL,
+        messages=[{
+            "role": "user",
+            "content": PROMPT,
+            "images": [img_b64]
+        }],
+        options={
+            "temperature": 0,
+            "num_predict": 4096,
+        }
+    )
+
+    raw = response.message.content.strip()
+
+    # Strip markdown fences if the model added them anyway
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        data = json.loads(raw)
+        total = sum(len(data.get(k, [])) for k in ['dividends', 'purchases', 'sales', 'interest'])
+        print(f"  -> Extracted {total} entries from page {page_num}")
+        for section in ['dividends', 'purchases', 'sales', 'interest']:
+            items = data.get(section, [])
+            if items:
+                print(f"     {section}: {len(items)}")
+        return data
+    except Exception as e:
+        print(f"  x Failed to parse page {page_num}: {e}")
+        print(f"    Raw (first 500 chars): {raw[:500]}")
+        return None
 
 
 # ─────────────────────────────────────────────
 # DATA HELPERS
 # ─────────────────────────────────────────────
 
-def merge_data(all_data, new_data):
-    for key in all_data:
-        all_data[key].extend(new_data.get(key, []))
+def merge_data(base, new):
+    for key in base:
+        base[key].extend(new.get(key, []))
 
 
 def group_by_name(entries):
@@ -203,76 +184,46 @@ def group_by_name(entries):
     return grouped
 
 
-def clean_data(data, page_data_list):
+def clean_data(data):
     """
     Post-processing fixes:
-
-    1. Sales: reset carry_value if it looks like an exchange fee (< $1).
-       NOTE: We no longer attempt to multiply amount × qty here — the column
-       hint now makes the model return correct totals directly. Multiplying
-       again would double-count and produce wildly wrong numbers.
-    2. Dividends: remove any entries where amount == 0 (parsing artefacts).
-    3. Interest: remove entries whose amount matches a known purchase OR
-       dividend amount (misread rows from adjacent layout columns).
-    4. Deduplicate: remove items that appear identically across pages.
+    1. Correct swapped quantity/price in purchases and sales.
+    2. Remove zero-amount dividends.
+    3. Remove interest entries that match purchase or dividend amounts.
+    4. Deduplicate across pages.
     """
 
-    # --- Fix 0: Correct swapped quantity ↔ price in sales/purchases ---
-    # When the model confuses the Price/Rate column for Quantity, you get
-    # a quantity like 551.2612 paired with an amount of 551.24 — implying
-    # a per-share price of ~$1, which is impossible for any ETF here.
-    # Heuristic: if amount / quantity < $10, the quantity is almost certainly
-    # the per-share price; the real quantity is round(amount / quantity).
+    # Fix 1: Swapped quantity/price
     for section in ('sales', 'purchases'):
         for item in data[section]:
-            qty = abs(item.get('quantity') or 0)
-            amt = abs(item.get('amount') or 0)
+            qty = abs(float(item.get('quantity') or 0))
+            amt = abs(float(item.get('amount') or 0))
             if qty > 0 and amt > 0 and (amt / qty) < 10:
-                corrected_qty = round(amt / qty)
-                print(f"  [fix] {section} {item.get('cusip')}: quantity "
-                      f"{qty} looks like a price → corrected to {corrected_qty} shares")
-                item['quantity'] = corrected_qty
+                corrected = round(amt / qty)
+                print(f"  [fix] {section} {item.get('cusip')}: qty {qty} "
+                      f"looks like price/share, corrected to {corrected} shares")
+                item['quantity'] = corrected
 
-    # --- Fix 1: Sales carry_value — clear if it looks like an exchange fee ---
-    for item in data['sales']:
-        cv = item.get('carry_value') or 0
-        if 0 < cv < 1.0:
-            print(f"  [fix] Sale {item.get('cusip')}: clearing carry_value "
-                  f"{cv} (looks like an exchange fee)")
-            item['carry_value'] = None
-
-    # --- Fix 2: Remove zero-amount dividends ---
+    # Fix 2: Zero-amount dividends
     before = len(data['dividends'])
-    data['dividends'] = [
-        d for d in data['dividends']
-        if float(d.get('amount') or 0) > 0
-    ]
-    removed = before - len(data['dividends'])
-    if removed:
-        print(f"  [fix] Removed {removed} zero-amount dividend(s)")
+    data['dividends'] = [d for d in data['dividends']
+                         if float(d.get('amount') or 0) > 0]
+    if len(data['dividends']) < before:
+        print(f"  [fix] Removed {before - len(data['dividends'])} zero-amount dividend(s)")
 
-    # --- Fix 3: Remove interest entries that match purchase OR dividend amounts ---
-    # Catches cases where an adjacent row (e.g. BSV dividend $7.80, VBR purchase
-    # $189.52) bleeds into the interest section due to OCR layout confusion.
-    purchase_amounts = {round(abs(float(p.get('amount', 0))), 2)
-                        for p in data['purchases']}
-    dividend_amounts = {round(abs(float(d.get('amount', 0))), 2)
-                        for d in data['dividends']}
-    known_non_interest = purchase_amounts | dividend_amounts
+    # Fix 3: Interest that matches purchase or dividend amounts
+    purchase_amts = {round(abs(float(p.get('amount', 0))), 2) for p in data['purchases']}
+    dividend_amts = {round(abs(float(d.get('amount', 0))), 2) for d in data['dividends']}
+    non_interest  = purchase_amts | dividend_amts
     before = len(data['interest'])
-    data['interest'] = [
-        i for i in data['interest']
-        if round(abs(float(i.get('amount', 0))), 2) not in known_non_interest
-    ]
-    removed = before - len(data['interest'])
-    if removed:
-        print(f"  [fix] Removed {removed} interest entry/entries that matched "
-              f"a purchase or dividend amount (likely misread rows)")
+    data['interest'] = [i for i in data['interest']
+                        if round(abs(float(i.get('amount', 0))), 2) not in non_interest]
+    if len(data['interest']) < before:
+        print(f"  [fix] Removed {before - len(data['interest'])} misread interest entry/entries")
 
-    # --- Fix 5: Deduplicate each section ---
+    # Fix 4: Deduplicate
     for section in data:
-        seen = set()
-        deduped = []
+        seen, deduped = set(), []
         for item in data[section]:
             key = json.dumps(item, sort_keys=True)
             if key not in seen:
@@ -286,231 +237,203 @@ def clean_data(data, page_data_list):
     return data
 
 
-# ─────────────────────────────────────────────
-# MAIN: EXTRACT
-# ─────────────────────────────────────────────
+def normalize_descriptions(data):
+    """Append ticker to description when multiple entries share the same name."""
+    for section in ['purchases', 'sales', 'interest', 'dividends']:
+        counts = Counter((item.get('description') or '').strip()
+                         for item in data[section])
+        for item in data[section]:
+            desc  = (item.get('description') or '').strip()
+            cusip = (item.get('cusip') or '').strip()
+            if counts[desc] > 1 and cusip:
+                item['description'] = f"{desc}: {cusip}"
 
-if __name__ == "__main__":
 
-    pages = pdf_page_to_text(PDF_PATH, PAGE_START, PAGE_END)
-
-    all_page_data = []
-
-    for i, page_text in enumerate(pages):
-        page_num = PAGE_START + i
-        print(f"\nSending page {page_num} to Ollama...")
-        print(page_text)   # preview first 1000 chars so you can sanity-check it
-
-        messages = [
-            {"role": "template", "content": json.dumps(template)},
-            {
-                "role": "user",
-                "content": (
-                    f"IMPORTANT – column layout for this statement:\n{column_hint}\n\n"
-                    "The text below is extracted line-by-line from a scanned PDF. "
-                    "Each printed row is one text line; columns are separated by tabs. "
-                    "When you extract sales, purchases, dividends and interest, "
-                    "'amount' must be the TOTAL dollar value (the Amount($) column), "
-                    "not the per-share price. There are NO multi-value cells — "
-                    "every value on a line belongs only to that one transaction row."
-                )
-            },
-            {
-                "role": "assistant",
-                "content": "Understood. I will use the Amount($) column for all 'amount' fields and treat each line as one transaction."
-            },
-            {
-                "role": "user",
-                "content": f"Page {page_num}:\n{page_text}"
-            }
-        ]
-
-        response = ollama.chat(
-            model=model,
-            messages=messages,
-            options={
-                "temperature": 0,
-                "num_predict": -2,
-                "repeat_penalty": 1.1,
-                "top_k": 1,
-                "num_ctx": 8192*2
-            }
-        )
-
-        try:
-            page_data = json.loads(response.message.content)
-            all_page_data.append(page_data)
-        except Exception as e:
-            print(f"Failed to parse page {page_num}: {e}")
-
-    # ── Merge pages ──────────────────────────────────────────────────────────
-    final_data = {
-        "dividends": [],
-        "purchases": [],
-        "sales": [],
-        "interest": []
-    }
-
-    for page_data in all_page_data:
-        merge_data(final_data, page_data)
-
-    # ── Post-processing fixes ────────────────────────────────────────────────
-    print("\nRunning post-processing fixes...")
-    data = clean_data(final_data, all_page_data)
-
-# ── Normalize duplicate descriptions ─────────────────────────────
-for section in ['purchases', 'sales', 'interest', 'dividends']:
-    # Count descriptions
-    desc_counts = Counter(
-        (item.get('description') or '').strip()
-        for item in data[section]
-    )
-
-    # Rename duplicates
-    for item in data[section]:
-        desc = (item.get('description') or '').strip()
-        cusip = (item.get('cusip') or '').strip()
-
-        if desc_counts[desc] > 1 and cusip:
-            item['description'] = f"{desc}: {cusip}"
-
-    # ── Sort ─────────────────────────────────────────────────────────────────
+def sort_data(data):
     for section in ['purchases', 'sales', 'interest']:
         data[section].sort(
             key=lambda x: (x.get('description') or '', x.get('date') or '')
         )
-    for section in ['dividends']:
-        data[section].sort(key=lambda x: (x.get('date') or ''))
-    print(json.dumps(data, indent=2))
+    data['dividends'].sort(key=lambda x: x.get('date') or '')
 
 
-    # ─────────────────────────────────────────────
-    # EXCEL OUTPUT
-    # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# VALIDATION
+# ─────────────────────────────────────────────
 
+# Update these from the Transactions Summary on page 4 of your statement
+KNOWN_TOTALS = {
+    "purchases": 2117.22,
+    "sales":     2679.69,
+    "dividends":   42.98,  # Cash Dividends only (excludes interest)
+    "interest":     2.61,
+}
+
+def validate_totals(data):
+    print("\n-- Validation ------------------------------------------")
+    for section, expected in KNOWN_TOTALS.items():
+        actual = sum(abs(float(item.get('amount', 0))) for item in data[section])
+        diff   = abs(actual - expected)
+        ok     = diff < 0.05
+        status = "OK " if ok else "MISMATCH"
+        print(f"  [{status}]  {section}: extracted ${actual:.2f}  "
+              f"expected ${expected:.2f}"
+              + (f"  (diff ${diff:.2f})" if not ok else ""))
+
+
+# ─────────────────────────────────────────────
+# EXCEL OUTPUT
+# ─────────────────────────────────────────────
+
+def write_excel(data, output_path):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Transactions"
 
-    row = 1
+    r = [1]  # mutable row counter
 
-    def write_row(cells, amount_cols=None, bold=False):
-        global row
-        if amount_cols is None:
-            amount_cols = []
+    AMOUNT_FMT = '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
+
+    def wr(cells, amount_cols=None, bold=False):
+        amount_cols = amount_cols or []
         for col, value in enumerate(cells, start=1):
-            cell = ws.cell(row=row, column=col, value=value)
+            cell = ws.cell(row=r[0], column=col, value=value)
             if col - 1 in amount_cols and (
                 isinstance(value, (int, float)) or
                 (isinstance(value, str) and value.startswith("="))
             ):
-                cell.number_format = (
-                    '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
-                )
+                cell.number_format = AMOUNT_FMT
             if bold:
                 cell.font = Font(bold=True)
-        row += 1
+        r[0] += 1
 
-    def add_space(rows):
-        for _ in range(rows):
-            write_row([])
+    def sp(n=1):
+        r[0] += n
 
-    # ── Purchases ────────────────────────────────────────────────────────────
-    write_row(['Purchases:'], bold=True)
-    purchases_grouped = group_by_name(data['purchases'])
-    for name, items in purchases_grouped.items():
-        write_row([name], bold=True)
-        add_space(1)
-        write_row(['Date', 'Quantity', 'Amount'], bold=True)
-        add_space(1)
+    def sumf(col_letter, r1, r2):
+        return f"=SUM({col_letter}{r1}:{col_letter}{r2})"
+
+    cl = get_column_letter
+
+    # ── Purchases ──────────────────────────────────────────────────
+    wr(['Purchases:'], bold=True)
+    sp()
+    for name, items in group_by_name(data['purchases']).items():
+        wr([name], bold=True)
+        sp()
+        wr(['Date', 'Quantity', 'Amount'], bold=True)
+        sp()
+        r1 = r[0]
         for item in items:
-            write_row(
-                [
-                    item['date'],
-                    f"{item['quantity']:.3f} shares" if item.get('quantity') else "",
-                    math.fabs(float(item['amount']))
-                ],
-                amount_cols=[2]
-            )
-        add_space(1)
-        write_row(
-            ['', 'Total',
-             f"=SUM({get_column_letter(3)}{row-len(items)-1}:{get_column_letter(3)}{row-1})"],
-            amount_cols=[2, 3], bold=True
-        )
-        add_space(3)
-    add_space(3)
+            wr([
+                item.get('date'),
+                f"{float(item['quantity']):.3f} shares" if item.get('quantity') else "",
+                math.fabs(float(item['amount']))
+            ], amount_cols=[2])
+        r2 = r[0] - 1
+        sp()
+        wr(['', 'Total', sumf('C', r1, r2)], amount_cols=[2], bold=True)
+        sp(3)
+    sp(2)
 
-    # ── Sales ────────────────────────────────────────────────────────────────
-    write_row(['Sales:'], bold=True)
-    sales_grouped = group_by_name(data['sales'])
-    for name, items in sales_grouped.items():
-        write_row([name], bold=True)
-        add_space(1)
-        write_row(
-            ['Date', 'Quantity', 'Carry Value', 'Sales Price', 'Gain', 'Loss'],
-            bold=True
-        )
-        add_space(1)
+    # ── Sales ──────────────────────────────────────────────────────
+    wr(['Sales:'], bold=True)
+    sp()
+    for name, items in group_by_name(data['sales']).items():
+        wr([name], bold=True)
+        sp()
+        wr(['Date', 'Quantity', 'Carry Value', 'Sales Price', 'Gain', 'Loss'], bold=True)
+        sp()
+        r1 = r[0]
         for item in items:
-            gain_loss   = item.get('realized_gain_loss', 0) or 0
-            carry_value = item.get('carry_value')
+            gl  = float(item.get('realized_gain_loss') or 0)
+            sp_ = float(item.get('amount') or 0)
+            cv  = sp_ - gl
+            wr([
+                item.get('date'),
+                f"{float(item['quantity']):.3f} shares" if item.get('quantity') else "",
+                cv,
+                sp_,
+                gl if gl > 0 else 0,
+                -gl if gl < 0 else 0,
+            ], amount_cols=[2, 3, 4, 5])
+        r2 = r[0] - 1
+        sp()
+        wr(['', 'Total',
+            sumf(cl(3), r1, r2), sumf(cl(4), r1, r2),
+            sumf(cl(5), r1, r2), sumf(cl(6), r1, r2)],
+           amount_cols=[2, 3, 4, 5], bold=True)
+        sp(3)
+    sp(2)
 
-            # Recalculate carry_value from amount − gain_loss if missing/tiny
-            if (carry_value is None or carry_value < 0.1) and gain_loss is not None:
-                carry_value = float(item['amount']) - float(gain_loss)
-
-            write_row(
-                [
-                    item['date'],
-                    f"{item['quantity']:.3f} shares" if item.get('quantity') else "",
-                    float(carry_value) if carry_value is not None else None,
-                    float(item['amount']) if item.get('amount') else None,
-                    float(gain_loss) if gain_loss > 0 else 0,
-                    float(-gain_loss) if gain_loss < 0 else 0
-                ],
-                amount_cols=[2, 3, 4, 5]
-            )
-        add_space(1)
-        write_row(
-            ['', 'Total',
-             f"=SUM({get_column_letter(3)}{row-len(items)-1}:{get_column_letter(3)}{row-1})",
-             f"=SUM({get_column_letter(4)}{row-len(items)-1}:{get_column_letter(4)}{row-1})",
-             f"=SUM({get_column_letter(5)}{row-len(items)-1}:{get_column_letter(5)}{row-1})",
-             f"=SUM({get_column_letter(6)}{row-len(items)-1}:{get_column_letter(6)}{row-1})"],
-            amount_cols=[2, 3, 4, 5, 6], bold=True
-        )
-        add_space(3)
-
-    # ── Dividends ────────────────────────────────────────────────────────────
-    write_row(['Dividends:'], bold=True)
-    write_row(['Date', 'Description', 'Amount'], bold=True)
+    # ── Dividends ──────────────────────────────────────────────────
+    wr(['Dividends:'], bold=True)
+    wr(['Date', 'Description', 'Amount'], bold=True)
+    r1 = r[0]
     for d in data['dividends']:
-        write_row([d['date'], d['description'], float(d['amount'])], amount_cols=[2])
-    add_space(1)
-    write_row(
-        ['', 'Total',
-         f"=SUM({get_column_letter(3)}{row-len(data['dividends'])-1}:{get_column_letter(3)}{row-1})"],
-        amount_cols=[2, 3], bold=True
-    )
-    add_space(3)
+        wr([d.get('date'), d.get('description'), float(d['amount'])], amount_cols=[2])
+    r2 = r[0] - 1
+    sp()
+    wr(['', 'Total', sumf('C', r1, r2)], amount_cols=[2], bold=True)
+    sp(3)
 
-    # ── Interest ─────────────────────────────────────────────────────────────
-    write_row(['Interest:'], bold=True)
-    write_row(['Date', 'Description', 'Amount'], bold=True)
+    # ── Interest ───────────────────────────────────────────────────
+    wr(['Interest:'], bold=True)
+    wr(['Date', 'Description', 'Amount'], bold=True)
+    r1 = r[0]
     for i in data['interest']:
-        write_row(
-            [i['date'], "Interest", float(i['amount'])],
-            amount_cols=[2], bold=True
-        )
-    add_space(1)
-    write_row(
-        ['', 'Total',
-         f"=SUM({get_column_letter(3)}{row-len(data['interest'])-1}:{get_column_letter(3)}{row-1})"],
-        amount_cols=[2, 3], bold=True
-    )
-    add_space(3)
+        wr([i.get('date'), i.get('description') or 'Interest', float(i['amount'])],
+           amount_cols=[2])
+    r2 = r[0] - 1
+    sp()
+    wr(['', 'Total', sumf('C', r1, r2)], amount_cols=[2], bold=True)
 
-    # ── Save ─────────────────────────────────────────────────────────────────
-    wb.save(OUTPUT_XLS)
-    print(f"\nSaved to {OUTPUT_XLS}")
+    # ── Column widths ──────────────────────────────────────────────
+    for col, width in zip('ABCDEF', [14, 22, 16, 16, 14, 14]):
+        ws.column_dimensions[col].width = width
+
+    wb.save(output_path)
+    print(f"\nSaved to {output_path}")
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    # 1. Convert PDF pages to images
+    print(f"Converting pages {PAGE_START}-{PAGE_END} of {PDF_PATH} to images...")
+    page_images = pdf_to_images(PDF_PATH, PAGE_START, PAGE_END)
+
+    # 2. Send each page image directly to the vision model
+    all_page_data = []
+    for page_num, image_path in page_images:
+        page_data = call_vision_model(page_num, image_path)
+        if page_data:
+            all_page_data.append(page_data)
+
+    if not all_page_data:
+        print("No data extracted. Check model output above.")
+        exit(1)
+
+    # 3. Merge pages
+    final_data = {"dividends": [], "purchases": [], "sales": [], "interest": []}
+    for page_data in all_page_data:
+        merge_data(final_data, page_data)
+
+    # 4. Clean, normalize, sort
+    print("\nRunning post-processing...")
+    data = clean_data(final_data)
+    normalize_descriptions(data)
+    sort_data(data)
+
+    # 5. Validate against statement totals
+    validate_totals(data)
+
+    # 6. Print extracted JSON
+    print("\n-- Extracted Data --------------------------------------")
+    print(json.dumps(data, indent=2))
+
+    # 7. Write Excel
+    write_excel(data, OUTPUT_XLS)
