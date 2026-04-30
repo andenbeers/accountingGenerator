@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PDF → docstrange (markdown) → nuextract (Ollama) → Excel
+PDF → docstrange (extract_data json_schema) → Excel
 """
 
 import json
@@ -12,7 +12,6 @@ os.environ["PATH"] = os.path.abspath(r"poppler\library\bin") + ";" + os.environ[
 
 from docstrange import DocumentExtractor
 from pypdf import PdfReader, PdfWriter
-import ollama
 import openpyxl
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
@@ -20,108 +19,126 @@ from openpyxl.utils import get_column_letter
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-MODEL      = os.getenv("MODEL", "frob/nuextract-2.0:latest")
 PDF_PATH   = "input4.pdf"
-PAGE_START = 4   # 1-indexed, inclusive
-PAGE_END   = 6   # 1-indexed, inclusive
+PAGE_START = 4
+PAGE_END   = 6
 OUTPUT_XLS = "transactions.xlsx"
 
-extractor = DocumentExtractor(gpu=True)
+extractor = DocumentExtractor(gpu=False)
 
-# ── EXTRACTION TEMPLATE ───────────────────────────────────────────────────────
+# ── SCHEMA ────────────────────────────────────────────────────────────────────
 
-TEMPLATE = {
-    "dividends": [
-        {"date": "string", "cusip": "string", "description": "string",
-         "amount": "number", "action": "Reinvestment or Cash"}
-    ],
+SCHEMA = {
     "purchases": [
-        {"date": "string", "cusip": "string", "description": "string",
-         "quantity": "number", "amount": "number"}
+        {
+            "date":        "string",
+            "cusip":       "string",
+            "description": "string",
+            "quantity":    "number",
+            "amount":      "number",
+        }
     ],
     "sales": [
-        {"date": "string", "cusip": "string", "description": "string",
-         "quantity": "number", "amount": "number",
-         "realized_gain_loss": "number", "carry_value": "number"}
+        {
+            "date":               "string",
+            "cusip":              "string",
+            "description":        "string",
+            "quantity":           "number",
+            "amount":             "number",
+            "realized_gain_loss": "number",
+            "carry_value":        "number",
+        }
     ],
-    # description required — anchors nuextract to real interest rows
-    # (e.g. "BANK INT 081624-091524") and prevents it grabbing
-    # numeric amounts from the Bank Sweep Activity section
+    "dividends": [
+        {
+            "date":        "string",
+            "cusip":       "string",
+            "description": "string",
+            "amount":      "number",
+            "action":      "string",
+        }
+    ],
+    # Only extract interest rows from the Transaction Details table
+    # where Category == "Interest". Bank Sweep Activity entries are NOT interest.
     "interest": [
-        {"date": "string", "description": "string", "amount": "number"}
+        {
+            "date":        "string",
+            "description": "string",
+            "amount":      "number",
+        }
     ],
 }
 
-USER_PROMPT = (
-    "Extract transactions ONLY from the 'Transaction Details' table. "
-    "IGNORE all other sections: 'Bank Sweep Activity', 'Cost Basis Lot Details', "
-    "'Positions', 'Account Summary', and any totals rows. "
-    "Use the Amount($) column for all 'amount' fields. "
-    "Each table row is one transaction. Quantity is negative for sales. "
-    "Only add a row to 'interest' when the Category column explicitly says 'Interest' — "
-    "bank sweep credits, beginning/ending balances, and brokerage credits are NOT interest."
-)
 
-ASSISTANT_ACK = (
-    "Understood. I will only extract rows from the Transaction Details table, "
-    "use Amount($) for all amounts, and only add rows to 'interest' "
-    "when Category is explicitly 'Interest'."
-)
+# ── STEP 1: PDF → STRUCTURED DATA ────────────────────────────────────────────
 
-
-# ── STEP 1: PDF → MARKDOWN ────────────────────────────────────────────────────
-
-def pdf_page_to_markdown(pdf_path: str, page_idx: int) -> str:
+def pdf_page_to_data(pdf_path: str, page_idx: int) -> dict:
     writer = PdfWriter()
     writer.add_page(PdfReader(pdf_path).pages[page_idx])
     tmp = f"/tmp/_page_{page_idx + 1}.pdf"
     with open(tmp, "wb") as f:
         writer.write(f)
-    return extractor.extract(tmp).extract_markdown()
+    result = extractor.extract(tmp)
+    data = result.extract_data(json_schema=SCHEMA)
+
+    # unwrap docstrange nesting: {"structured_data": {"content": {...}}}
+    if isinstance(data, dict):
+        if "structured_data" in data:
+            data = data["structured_data"]
+        if "content" in data:
+            data = data["content"]
+
+    return data if isinstance(data, dict) else {}
 
 
-def extract_pages(pdf_path: str, start: int, end: int) -> list[tuple[int, str]]:
+def extract_pages(pdf_path: str, start: int, end: int) -> list[tuple[int, dict]]:
     pages = []
     for idx in range(start - 1, end):
         print(f"  docstrange → page {idx + 1} …", end=" ", flush=True)
-        md = pdf_page_to_markdown(pdf_path, idx)
-        print(f"done ({len(md)} chars)")
-        print(f"  preview: {md[:300].strip()!r}\n")
-        if md.strip():
-            pages.append((idx + 1, md))
+        data = pdf_page_to_data(pdf_path, idx)
+        print(f"done")
+        print(f"  preview: {json.dumps(data)[:300]}\n")
+        if data:
+            pages.append((idx + 1, data))
         else:
-            print(f"  [warn] page {idx + 1} empty, skipping")
+            print(f"  [warn] page {idx + 1} returned no data, skipping")
     return pages
 
 
-# ── STEP 2: MARKDOWN → JSON (nuextract via Ollama) ────────────────────────────
-
-def extract_transactions(page_num: int, markdown: str) -> dict | None:
-    messages = [
-        {"role": "template",  "content": json.dumps(TEMPLATE)},
-        {"role": "user",      "content": USER_PROMPT},
-        {"role": "assistant", "content": ASSISTANT_ACK},
-        {"role": "user",      "content": f"Page {page_num}:\n{markdown}"},
-    ]
-    response = ollama.chat(
-        model=MODEL,
-        messages=messages,
-        options={"temperature": 0, "num_predict": -2, "top_k": 1, "num_ctx": 16384},
-        
-    )
-    try:
-        return json.loads(response.message.content)
-    except Exception as e:
-        print(f"  [warn] page {page_num} parse failed: {e}")
-        return None
-
+# ── STEP 2: MERGE + DEDUPLICATE ───────────────────────────────────────────────
 
 def merge(base: dict, new: dict) -> None:
     for key in base:
-        base[key].extend(new.get(key, []))
+        items = new.get(key, [])
+        if isinstance(items, list):
+            base[key].extend(items)
+
+
+def _safe_amount(item: dict) -> float:
+    """Parse amount robustly regardless of type."""
+    val = item.get("amount") or 0
+    try:
+        return round(float(str(val).replace(",", "").strip()), 2)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _interest_key(item: dict) -> tuple:
+    """
+    Dedup key for interest: (rounded_amount, month).
+    The same payment appears in Transaction Details (date=09/16)
+    and Bank Sweep Activity (date=09/15) — same month, same amount.
+    Keeping only the first occurrence (Transaction Details) is correct.
+    """
+    amt = _safe_amount(item)
+    date = str(item.get("date") or "")
+    # Use just the month portion so 09/15 and 09/16 collapse together
+    month = date.split("/")[0] if "/" in date else date[:7]
+    return (amt, month)
 
 
 def deduplicate(data: dict) -> dict:
+    # Generic dedup by full JSON equality for all sections
     for section, items in data.items():
         seen, out = set(), []
         for item in items:
@@ -131,31 +148,43 @@ def deduplicate(data: dict) -> dict:
                 out.append(item)
         removed = len(items) - len(out)
         if removed:
-            print(f"  [fix] removed {removed} duplicate(s) from '{section}'")
+            print(f"  [fix] removed {removed} exact duplicate(s) from '{section}'")
         data[section] = out
 
-    # Interest-specific filters:
-    # 1. Drop entries with no day in the date (e.g. "2024-09") — those are summary totals
-    # 2. Drop entries where description contains "rate" — those are interest rate percentages, not payments
-    # 3. Deduplicate by amount — Bank Sweep Activity echoes the same payment with a different date
+    # Interest-specific filters
     clean = []
     for item in data["interest"]:
         date = str(item.get("date") or "")
-        amt  = round(float(item.get("amount") or 0), 2)
-        if date.count("-") < 2:
-            print(f"  [fix] dropped interest row — date has no day: {date}")
+        desc = str(item.get("description") or "").lower()
+
+        # Drop summary rows with no day (e.g. "2024-09")
+        if date.count("-") >= 1 and date.count("-") < 2 and len(date) <= 7:
+            print(f"  [fix] dropped interest — no day in date: {date!r}")
             continue
-        if "rate" in str(item.get("description") or "").lower():
-            print(f"  [fix] dropped interest row — description looks like a rate: {item.get('description')}")
+
+        # Drop rate rows
+        if "rate" in desc:
+            print(f"  [fix] dropped interest — looks like a rate: {desc!r}")
             continue
+
+        # Drop Bank Sweep Activity echo rows — they say "bank interest" or
+        # "bank sweep" in the description but come from the sweep section
+        if "bank sweep" in desc or ("bank interest" in desc and "bank int " not in desc):
+            print(f"  [fix] dropped interest — bank sweep echo: {desc!r}")
+            continue
+
         clean.append(item)
 
-    seen_amt, deduped = set(), []
+    # Dedup by (amount, month) — catches same payment with different day
+    seen_key, deduped = set(), []
     for item in clean:
-        amt = round(float(item.get("amount") or 0), 2)
-        if amt not in seen_amt:
-            seen_amt.add(amt)
+        k = _interest_key(item)
+        if k not in seen_key:
+            seen_key.add(k)
             deduped.append(item)
+        else:
+            print(f"  [fix] dropped interest duplicate: amount={k[0]} month={k[1]}")
+
     removed = len(data["interest"]) - len(deduped)
     if removed:
         print(f"  [fix] interest: kept {len(deduped)} of {len(data['interest'])} entries")
@@ -266,7 +295,6 @@ class Sheet:
 _ticker_cache: dict[str, str] = {}
 
 def _resolve_name(cusip: str | None, fallback: str | None) -> str:
-    """Use yfinance name as-is if found; otherwise title-case the statement description."""
     symbol = (cusip or "").strip().upper()
     if symbol and symbol not in _ticker_cache:
         try:
@@ -280,11 +308,9 @@ def _resolve_name(cusip: str | None, fallback: str | None) -> str:
     return _ticker_cache.get(symbol) or _title(fallback or "Unknown")
 
 def _title(s: str) -> str:
-    """Title-case: first letter of each word capitalised, rest lower."""
     return s.strip().title() if s else s
 
 def resolve_names(data: dict) -> dict:
-    """Enrich every item's description using its cusip/ticker symbol."""
     for section in data.values():
         for item in section:
             item["description"] = _resolve_name(item.get("cusip"), item.get("description"))
@@ -307,21 +333,14 @@ def _shares(item: dict) -> str:
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    try:
-        ollama.generate(model=MODEL, prompt="", keep_alive=0)
-        print("[0] Ollama model unloaded from VRAM")
-    except Exception:
-        pass
     print(f"\n[1] Extracting pages {PAGE_START}–{PAGE_END} with docstrange …")
     pages = extract_pages(PDF_PATH, PAGE_START, PAGE_END)
 
-    print(f"\n[2] Sending to Ollama ({MODEL}) …")
+    print("\n[2] Merging pages …")
     data: dict = {"dividends": [], "purchases": [], "sales": [], "interest": []}
-    for page_num, markdown in pages:
+    for page_num, raw in pages:
         print(f"  page {page_num} …")
-        result = extract_transactions(page_num, markdown)
-        if result:
-            merge(data, result)
+        merge(data, raw)
 
     print("\n[3] Deduplicating …")
     data = deduplicate(data)
